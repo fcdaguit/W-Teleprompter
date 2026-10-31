@@ -26,11 +26,12 @@ Bisaya mode also treats o/u, e/i, c/k, ph/f and doubled letters as equal and all
 ## Keys
 
 Space or click: play / pause / resume. R: reset. H: settings panel. F11: full screen. Esc: leave full screen. + / -: text size. Ctrl+Q: quit.
+**Loading a script:** Ctrl+V pastes the script from the clipboard, Ctrl+O opens a `.txt` or Word `.docx` file, Ctrl+E opens a type/paste box. The same options are under H > Script. PDFs can't be opened directly: copy the text and press Ctrl+V.
 Mouse wheel scrolls manually at any time. `[text in brackets]` is shown but not expected to be spoken.
 
 ## Notes
 
 - Needs a working microphone (set as Windows default input). Timer mode needs none.
-- Scripts are saved in `%APPDATA%\TermPrompter\scripts`. A crash log, if any, is `%APPDATA%\TermPrompter\crash.log`.
+- Scripts are saved in `%APPDATA%\TermPrompter\scripts`. If something goes wrong, a message appears and details are written to `%APPDATA%\TermPrompter\crash.log`.
 - Write numbers as words in your script ("twenty twenty-six"); digits will not match speech.
 - Not yet run on Windows. The matcher is tested; the window, microphone and packaging are untested, so expect small fixes on first build.
