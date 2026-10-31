@@ -41,6 +41,55 @@ HELP = ("Space / click: play, pause, resume     R: reset     H: settings panel\n
         "F11: full screen     Esc: leave full screen     + / -: text size     Ctrl+Q: quit")
 
 
+# ---------------------------------------------------------------- reading script files
+
+def read_docx(path):
+    """Plain text of a Word .docx (one line per paragraph); no extra libraries needed."""
+    import xml.etree.ElementTree as ET
+    w = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    with zipfile.ZipFile(path) as z:
+        root = ET.fromstring(z.read("word/document.xml"))
+    paras = []
+    for p in root.iter(w + "p"):
+        parts = []
+        for el in p.iter():
+            if el.tag == w + "t":
+                parts.append(el.text or "")
+            elif el.tag == w + "tab":
+                parts.append(" ")
+            elif el.tag in (w + "br", w + "cr"):
+                parts.append("\n")
+        paras.append("".join(parts))
+    return "\n".join(paras)
+
+
+def read_script_file(path):
+    """Read a script from .txt / .docx. Raises ValueError with a readable message otherwise."""
+    import codecs
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".docx":
+        return read_docx(path)
+    if ext in (".pdf", ".doc", ".rtf", ".xlsx", ".pptx", ".odt"):
+        raise ValueError(f"{ext} files cannot be opened directly.\n\nCopy the text, then use "
+                         "Script > Paste from clipboard (Ctrl+V), or save it as .txt first.")
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw.startswith(codecs.BOM_UTF8):
+        return raw.decode("utf-8-sig")
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return raw.decode("utf-16")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")      # Windows "ANSI" files (e.g. Notepad, Word .txt)
+
+
+def clean_script(text):
+    """Drop control characters and characters Tk cannot always draw (emoji etc.); they are never spoken."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
+    return "".join(ch for ch in text if (ch == "\n" or ch >= " ") and ord(ch) <= 0xFFFF)
+
+
 # ---------------------------------------------------------------- models
 
 def model_dirs(lang):
@@ -212,9 +261,16 @@ class App:
                         ("h", self.toggle_panel), ("H", self.toggle_panel), ("<F11>", self.toggle_fullscreen),
                         ("<Escape>", self.leave_fullscreen), ("<plus>", lambda: self.bump(2)),
                         ("<equal>", lambda: self.bump(2)), ("<minus>", lambda: self.bump(-2)),
-                        ("<Control-q>", self.quit)):
+                        ("<Control-q>", self.quit),
+                        ("<Control-v>", self.paste_clipboard),
+                        ("<Control-V>", self.paste_clipboard),
+                        ("<Control-o>", lambda: self.with_dialog(self.open_file)),
+                        ("<Control-O>", lambda: self.with_dialog(self.open_file)),
+                        ("<Control-e>", lambda: self.with_dialog(self.edit_dialog)),
+                        ("<Control-E>", lambda: self.with_dialog(self.edit_dialog))):
             root.bind(key, lambda e, f=fn: (f(), "break")[1])
 
+        root.report_callback_exception = self.on_exception   # packaged .exe has no console: show errors instead
         root.protocol("WM_DELETE_WINDOW", self.quit)
         self.fullscreen = False
         self.set_script(self.script)
@@ -318,6 +374,7 @@ class App:
     # ---------- script
     def set_script(self, text):
         self.pause()
+        text = clean_script(text)
         self.script = text
         self.phrases = split_phrases(text, self.lang)
         self.matcher.profile = Profile(self.tol, self.lang)
@@ -360,17 +417,68 @@ class App:
             t.tag_configure("cur", foreground=AMBER if self.adlib else NEON,
                             background=AMBER_BG if self.adlib else NEON_BG)
 
+    # ---------- dialogs: full screen is suspended while one is open so it can never hide behind the window
+    def with_dialog(self, fn):
+        was = self.fullscreen
+        if was:
+            self.fullscreen = False
+            self.root.attributes("-fullscreen", False)
+            self.root.update()
+        try:
+            return fn()
+        finally:
+            if was:
+                self.fullscreen = True
+                self.root.attributes("-fullscreen", True)
+
+    def msg(self, kind, text):
+        f = messagebox.showerror if kind == "error" else messagebox.showinfo
+        self.with_dialog(lambda: f(APP_NAME, text, parent=self.root))
+
+    def flash(self, msg):
+        self.set_status(msg)
+        self.root.after(3000, self.set_status)
+
+    def on_exception(self, exc, val, tb):
+        text = "".join(traceback.format_exception(exc, val, tb))
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(os.path.join(DATA_DIR, "crash.log"), "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n" + text + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.busy = False
+            self.msg("error", "Something went wrong:\n\n" + text.strip().splitlines()[-1] +
+                                 "\n\nDetails were saved to:\n" + os.path.join(DATA_DIR, "crash.log"))
+        except Exception:  # noqa: BLE001
+            pass
+
     def script_menu(self):
         m = tk.Menu(self.root, tearoff=0, bg=BLACK, fg=NEON, activebackground=NEON_BG, activeforeground=NEON)
-        m.add_command(label="Paste / edit script…", command=self.edit_dialog)
-        m.add_command(label="Open text file…", command=self.open_file)
+        d = self.with_dialog
+        m.add_command(label="Paste from clipboard   (Ctrl+V)", command=self.paste_clipboard)
+        m.add_command(label="Type / edit script…   (Ctrl+E)", command=lambda: d(self.edit_dialog))
+        m.add_command(label="Open .txt / .docx file…   (Ctrl+O)", command=lambda: d(self.open_file))
         m.add_separator()
-        m.add_command(label="Save script…", command=self.save_script)
-        m.add_command(label="Load saved script…", command=self.load_saved)
-        m.add_command(label="Delete saved script…", command=self.delete_saved)
-        x = self.root.winfo_pointerx()
-        y = self.root.winfo_pointery()
-        m.tk_popup(x, y)
+        m.add_command(label="Save script…", command=lambda: d(self.save_script))
+        m.add_command(label="Load saved script…", command=lambda: d(self.load_saved))
+        m.add_command(label="Delete saved script…", command=lambda: d(self.delete_saved))
+        try:
+            m.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
+        finally:
+            m.grab_release()
+
+    def paste_clipboard(self):
+        try:
+            txt = self.root.clipboard_get()
+        except tk.TclError:
+            txt = ""
+        if not txt.strip():
+            self.msg("info", "The clipboard has no text. Copy your script first, then try again.")
+            return
+        self.set_script(txt)
+        self.flash(f"LOADED {len(self.phrases)} LINES")
 
     def edit_dialog(self):
         win = tk.Toplevel(self.root)
@@ -378,6 +486,8 @@ class App:
         win.configure(bg=BLACK)
         win.geometry("760x520")
         win.transient(self.root)
+        win.lift()
+        win.focus_force()
         box = tk.Text(win, bg=BLACK, fg=NEON, insertbackground=NEON, font=("Consolas", 13), wrap="word",
                       relief="flat", highlightthickness=1, highlightbackground=NEON, padx=10, pady=10)
         box.pack(fill="both", expand=True, padx=8, pady=8)
@@ -386,28 +496,38 @@ class App:
         bar = tk.Frame(win, bg=BLACK)
         bar.pack(fill="x", padx=8, pady=(0, 8))
 
-        def use():
-            txt = box.get("1.0", "end").strip("\n")
-            win.destroy()
-            self.set_script(txt)
+        result = []
 
-        for label, cmd in (("Use", use), ("Cancel", win.destroy)):
+        def use():
+            result.append(box.get("1.0", "end").strip("\n"))
+            win.destroy()
+
+        for label, cmd in (("Use this script", use), ("Cancel", win.destroy)):
             tk.Button(bar, text=label, command=cmd, bg=BLACK, fg=NEON, activebackground=NEON_BG,
                       activeforeground=NEON, relief="flat", highlightthickness=1, highlightbackground=NEON,
                       font=("Consolas", 11), padx=14, pady=4).pack(side="left", padx=4)
 
+        win.grab_set()
+        self.root.wait_window(win)              # modal: returns when the dialog closes
+        if result:
+            self.set_script(result[0])
+            self.flash(f"LOADED {len(self.phrases)} LINES")
+
     def open_file(self):
-        path = filedialog.askopenfilename(title="Open script", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        path = filedialog.askopenfilename(parent=self.root, title="Open script",
+                                          filetypes=[("Script files", "*.txt *.docx"), ("All files", "*.*")])
         if not path:
             return
-        for enc in ("utf-8-sig", "utf-16", "cp1252"):
-            try:
-                with open(path, "r", encoding=enc) as f:
-                    self.set_script(f.read())
-                return
-            except Exception:  # noqa: BLE001
-                continue
-        messagebox.showerror(APP_NAME, "Could not read that file.")
+        try:
+            text = read_script_file(path)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror(APP_NAME, f"Could not open that file.\n\n{e}", parent=self.root)
+            return
+        if not text.strip():
+            messagebox.showinfo(APP_NAME, "That file has no text in it.", parent=self.root)
+            return
+        self.set_script(text)
+        self.flash(f"LOADED {len(self.phrases)} LINES")
 
     def save_script(self):
         name = simpledialog.askstring(APP_NAME, "Script name:", parent=self.root)
@@ -418,11 +538,11 @@ class App:
             f.write(self.script)
 
     def load_saved(self):
-        path = filedialog.askopenfilename(title="Load saved script", initialdir=SCRIPT_DIR,
+        path = filedialog.askopenfilename(parent=self.root, title="Load saved script", initialdir=SCRIPT_DIR,
                                           filetypes=[("Text files", "*.txt")])
         if path:
-            with open(path, "r", encoding="utf-8") as f:
-                self.set_script(f.read())
+            self.set_script(read_script_file(path))
+            self.flash(f"LOADED {len(self.phrases)} LINES")
 
     def delete_saved(self):
         path = filedialog.askopenfilename(title="Delete which saved script?", initialdir=SCRIPT_DIR,
@@ -440,8 +560,11 @@ class App:
             m.add_command(label=("● " if l == self.lang else "○ ") + f"{l.label}   [{state}]",
                           command=lambda l=l: self.set_lang(l))
         m.add_separator()
-        m.add_command(label="Import voice model (.zip)…", command=self.import_model)
-        m.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
+        m.add_command(label="Import voice model (.zip)…", command=lambda: self.with_dialog(self.import_model))
+        try:
+            m.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
+        finally:
+            m.grab_release()
 
     def set_lang(self, l):
         self.pause()
@@ -449,8 +572,9 @@ class App:
         self.set_script(self.script)
         self.refresh_buttons()
         if not resolve_model(l):
-            messagebox.showinfo(APP_NAME, f"No offline voice model for {l.label} yet.\n"
-                                          "Use Lang > Import voice model (.zip), or use Timer mode.")
+            self.with_dialog(lambda: messagebox.showinfo(
+                APP_NAME, f"No offline voice model for {l.label} yet.\n"
+                          "Use Lang > Import voice model (.zip), or use Timer mode."))
 
     def import_model(self):
         win = tk.Toplevel(self.root)
@@ -481,7 +605,12 @@ class App:
             tk.Button(win, text=l.label, command=lambda l=l: pick(l), bg=BLACK, fg=NEON, activebackground=NEON_BG,
                       activeforeground=NEON, relief="flat", highlightthickness=1, highlightbackground=NEON,
                       font=("Consolas", 11), width=24, pady=4).pack(padx=16, pady=3)
-        tk.Frame(win, height=10, bg=BLACK).pack()
+        tk.Button(win, text="Cancel", command=win.destroy, bg=BLACK, fg=DIM, relief="flat",
+                  font=("Consolas", 10)).pack(pady=(4, 10))
+        win.lift()
+        win.focus_force()
+        win.grab_set()
+        self.root.wait_window(win)
 
     # ---------- playback
     def toggle_play(self):
@@ -505,7 +634,7 @@ class App:
         if self.busy:
             return
         if not self.phrases:
-            messagebox.showinfo(APP_NAME, "Add a script first.")
+            self.msg("info", "Add a script first.")
             return
         if self.timer_mode:
             self.playing = self.started = True
@@ -520,7 +649,7 @@ class App:
             return
         res = resolve_model(self.lang)
         if not res:
-            messagebox.showinfo(APP_NAME, f"No offline voice model for {self.lang.label}.\n"
+            self.msg("info", f"No offline voice model for {self.lang.label}.\n"
                                           "Use Lang > Import voice model (.zip), or switch to Timer mode.")
             return
         self.busy = True
@@ -556,9 +685,9 @@ class App:
                     self.busy = False
                     l, err = payload
                     if err:
-                        messagebox.showerror(APP_NAME, err)
+                        self.msg("error", err)
                     else:
-                        messagebox.showinfo(APP_NAME, f"{l.label} model installed.")
+                        self.msg("info", f"{l.label} model installed.")
                     self.set_status()
                     continue
                 if sess != self.session:
@@ -572,7 +701,7 @@ class App:
                     self.apply_state()
                 elif kind == "error":
                     self.pause()
-                    messagebox.showerror(APP_NAME, "Voice error: " + str(payload))
+                    self.msg("error", "Voice error: " + str(payload))
                 elif kind == "text" and self.playing:
                     text, final = payload
                     changed = self.matcher.feed(tokenize(text, self.lang))
